@@ -1,9 +1,10 @@
 """
-Load **fundamentals_daily** + **technicals_daily** + raw FX parquets from the ETF Forecaster
+Load **fundamentals_daily** + **technicals_daily** + raw FX parquets from the
 ``fx_data_collect`` repository (fresh Yahoo/FRED-backed panel).
 
-Set ``FXNL_DATA_REPO`` to the ``.../fx_data_collect/data`` folder, or rely on the default
-sibling layout: ``../ETF Forecaster/fx_data_collect/data``.
+Set ``FXNL_DATA_REPO`` to the ``.../fx_data_collect/data`` folder, or rely on discovery:
+``…/Mo_Dash/FX/FX forecasts/fx_data_collect/data`` (walk upward from this package), or legacy
+``../ETF Forecaster/fx_data_collect/data``.
 """
 
 from __future__ import annotations
@@ -54,8 +55,23 @@ def _load_dotenv_paths() -> None:
         load_dotenv(THIS_ROOT / ".env")
         load_dotenv(THIS_ROOT.parent / "Currencies" / ".env")
         load_dotenv(THIS_ROOT.parent / "ETF Forecaster" / ".env")
+        load_dotenv(THIS_ROOT.parent / "Mo_Dash" / "ETF" / "ETF Forecaster" / ".env")
+        load_dotenv(THIS_ROOT.parent / "Mo_Dash" / "ETF" / "ETF Forecaster" / "project" / ".env")
     except Exception:
         pass
+
+
+def _discover_mo_dash_fx_repo_data() -> Path | None:
+    """Find ``…/FX/FX forecasts/fx_data_collect/data`` by walking parents of the FX project root."""
+    cur = THIS_ROOT.resolve()
+    for _ in range(16):
+        cand = cur / "FX" / "FX forecasts" / "fx_data_collect" / "data"
+        if _repo_ok(cand):
+            return cand.resolve()
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
 
 
 def data_repo_root() -> Path | None:
@@ -68,7 +84,12 @@ def data_repo_root() -> Path | None:
             return p
         logger.warning("FXNL_DATA_REPO set but invalid or missing model_inputs: %s", p)
 
+    discovered = _discover_mo_dash_fx_repo_data()
+    if discovered is not None:
+        return discovered
+
     candidates = [
+        THIS_ROOT.parent / "Mo_Dash" / "FX" / "FX forecasts" / "fx_data_collect" / "data",
         THIS_ROOT.parent / "ETF Forecaster" / "fx_data_collect" / "data",
         THIS_ROOT.parent.parent / "ETF Forecaster" / "fx_data_collect" / "data",
     ]
@@ -123,9 +144,14 @@ def _strip_tz_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _live_quote_enabled() -> bool:
-    """Truthy ``FXNL_INJECT_LIVE_QUOTE`` env var enables today-bar synthesis."""
-    v = (os.environ.get("FXNL_INJECT_LIVE_QUOTE") or "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    """Live today-bar synthesis (only after NY 5 PM unless ``FXNL_INJECT_LIVE_QUOTE=force``)."""
+    try:
+        from fxnl.fx_session_calendar import should_inject_live_today_bar  # noqa: PLC0415
+
+        return should_inject_live_today_bar()
+    except Exception:
+        v = (os.environ.get("FXNL_INJECT_LIVE_QUOTE") or "").strip().lower()
+        return v in ("1", "true", "yes", "on", "force")
 
 
 def _read_raw_fx_with_optional_live(fx_path: Path, instrument: str) -> pd.DataFrame:
@@ -142,6 +168,16 @@ def _read_raw_fx_with_optional_live(fx_path: Path, instrument: str) -> pd.DataFr
             raw = append_live_today_bar(raw, instrument)
         except Exception as e:
             logger.warning("Live-quote injection failed for %s: %s", instrument, e)
+    elif (os.environ.get("FXNL_INJECT_LIVE_QUOTE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        logger.info(
+            "Skipping live quote for %s — before NY 5 PM close (see fxnl.fx_session_calendar).",
+            instrument,
+        )
     return raw
 
 
