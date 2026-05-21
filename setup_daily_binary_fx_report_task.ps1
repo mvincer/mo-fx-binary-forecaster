@@ -1,7 +1,10 @@
 $ErrorActionPreference = "Stop"
 
+# Legacy task setup (predates the unified run_fx_daily_refresh pipeline).
+# Kept for backward compatibility. Paths are derived relative to this script
+# so the task survives if Mo_Dash is moved.
 $TaskName = "Daily FX Binary Forecast Report"
-$ProjectRoot = "C:\Users\mrmhr\OneDrive\Documents\Python\FX_NonLinear_Forecast_Direction"
+$ProjectRoot = $PSScriptRoot
 $ScriptPath = Join-Path $ProjectRoot "run_daily_binary_fx_report.ps1"
 
 if (-not (Test-Path $ScriptPath)) {

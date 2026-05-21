@@ -1,6 +1,8 @@
 $ErrorActionPreference = "Stop"
 
-$ProjectRoot = "C:\Users\mrmhr\OneDrive\Documents\Python\FX_NonLinear_Forecast_Direction"
+# Legacy report runner (predates run_fx_daily_refresh.ps1). Path is derived
+# from this script's location so it works regardless of where Mo_Dash lives.
+$ProjectRoot = $PSScriptRoot
 Set-Location $ProjectRoot
 
 # Requires these user or machine environment variables:
