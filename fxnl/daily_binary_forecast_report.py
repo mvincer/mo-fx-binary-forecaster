@@ -23,16 +23,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from fxnl.data_panel import _primary_high_low_close, prepare_direction_frame
+from fxnl.data_panel import prepare_direction_frame
 from fxnl.paths import patch_currencies_sys_path
 from fxnl.qualified_models import load_qualified_models
 from fxnl.rolling_tune_oos import _grid_variants_for_family, _prep_deploy_full_one
-from fxnl.targets import (
-    binary_labels,
-    binary_labels_high_low,
-    forward_simple_return,
-    forward_window_excursions,
-)
+from fxnl.targets import binary_labels, forward_simple_return
 
 logger = logging.getLogger(__name__)
 
@@ -135,18 +130,7 @@ def _cached_features_panel(primary: str, all_pairs: list[str]) -> dict[str, Any]
         return _PANEL_CACHE[key]
     close = close.reindex(X.index).astype(float)
 
-    try:
-        hi_lo = _primary_high_low_close(primary, "max", None, X.index)
-    except Exception as e:
-        logger.warning("hi/lo fetch failed for %s: %s", primary, e)
-        hi_lo = None
-
-    _PANEL_CACHE[key] = {
-        "X": X,
-        "close": close,
-        "hi_lo_close": hi_lo,
-        "error": "",
-    }
+    _PANEL_CACHE[key] = {"X": X, "close": close, "error": ""}
     return _PANEL_CACHE[key]
 
 
@@ -155,23 +139,25 @@ def _forecast_one(
     primary: str,
     all_pairs: list[str],
     lead: int,
-    target_basis: str,
     chosen_variant: str,
     lookback_bars: int,
     pca_k: int,
     family_filter: str,
     align_to_next_bar: bool = False,
 ) -> dict[str, Any]:
-    """Refit `chosen_variant` on the latest labeled history and forecast one bar.
+    """Refit ``chosen_variant`` on the latest labeled history and forecast one bar.
 
-    When ``align_to_next_bar`` is True the input feature row is taken at index
-    ``n - lead`` (n = panel length with the unlabeled tail), so a lead-L model
-    forecasts the **next bar after the panel end** — i.e. every lead targets the
-    same forecast date ("tomorrow"). Otherwise the latest available feature row
-    (index -1) is used and lead-L forecasts ``panel_end + L`` bars.
+    **Target basis is always ``close``** — high/low excursion labels were retired.
 
-    The heavy panel build is cached per primary (see ``_cached_features_panel``);
-    here we just compute labels for this ``(lead, target_basis)`` and refit.
+    **Dates** (single source of truth: :mod:`fxnl.fx_session_calendar`, 5 PM NY rule):
+
+    - ``data_through_date`` — last business day whose close may be used (today after 5 PM
+      NY on a workday; previous business day otherwise).
+    - ``target_forecast_date`` — next business day after ``data_through_date``.
+
+    The panel is trimmed so no row past ``data_through_date`` ever feeds the model. With
+    ``align_to_next_bar=True`` every lead reports the **same** ``target_forecast_date``
+    derived from the clock, never from a stale panel index.
     """
     panel = _cached_features_panel(primary, list(all_pairs))
     if panel is None or panel.get("error"):
@@ -179,20 +165,22 @@ def _forecast_one(
 
     X: pd.DataFrame = panel["X"]
     close: pd.Series = panel["close"]
-    hi_lo = panel.get("hi_lo_close")
+
+    from fxnl.fx_session_calendar import (  # noqa: PLC0415
+        fx_session_dates,
+        trim_index_to_data_through,
+    )
+
+    data_through_ts, target_forecast_ts = fx_session_dates()
+
+    keep_ix = trim_index_to_data_through(X.index)
+    if len(keep_ix) < len(X):
+        X = X.loc[keep_ix]
+        close = close.reindex(X.index)
 
     L = int(lead)
-    tb = str(target_basis or "close").strip().lower()
-
     r = forward_simple_return(close, L)
-    if tb in ("high_low", "hl", "path"):
-        if hi_lo is None:
-            return {"forecast_error": "high_low_data_missing_for_primary"}
-        high_s, low_s, close_s = hi_lo
-        exc = forward_window_excursions(high_s, low_s, close_s, L)
-        y = binary_labels_high_low(exc, tie_break_close=True)
-    else:
-        y = binary_labels(r)
+    y = binary_labels(r)
 
     y = y.reindex(X.index)
     r = r.reindex(X.index)
@@ -208,7 +196,6 @@ def _forecast_one(
         y_labeled = y_labeled.loc[X_labeled.index]
 
     n = len(X)
-    L = int(lead)
     if align_to_next_bar:
         if n < L + 1:
             return {"forecast_error": f"panel_too_short_for_lead:n={n},lead={L}"}
@@ -216,17 +203,16 @@ def _forecast_one(
     else:
         input_idx = n - 1
     X_live = X.iloc[[input_idx]]
-    latest_feature_date = pd.Timestamp(X.index[-1])
-    input_feature_date = pd.Timestamp(X.index[input_idx])
+    panel_end_date = pd.Timestamp(X.index[-1]).normalize()
+    input_feature_date = pd.Timestamp(X.index[input_idx]).normalize()
     latest_labeled_date = pd.Timestamp(X_labeled.index[-1])
+
+    latest_feature_date = data_through_ts
     if align_to_next_bar:
-        latest_norm = latest_feature_date.normalize()
-        model_target = (latest_norm + pd.tseries.offsets.BDay(1)).normalize()
-        ny_today = pd.Timestamp.now(tz="America/New_York").normalize().tz_localize(None)
-        calendar_next = (ny_today + pd.tseries.offsets.BDay(1)).normalize()
-        target_forecast_date = max(model_target, calendar_next)
+        target_forecast_date = target_forecast_ts
     else:
-        target_forecast_date = (latest_feature_date + pd.tseries.offsets.BDay(L)).normalize()
+        target_forecast_date = (data_through_ts + pd.tseries.offsets.BusinessDay(L)).normalize()
+
     latest_panel_close = float(close.iloc[-1]) if isinstance(close, pd.Series) and pd.notna(close.iloc[-1]) else float("nan")
     input_close = (
         float(close.iloc[input_idx]) if isinstance(close, pd.Series) and pd.notna(close.iloc[input_idx]) else float("nan")
@@ -269,6 +255,8 @@ def _forecast_one(
         "latest_labeled_date": latest_labeled_date.date().isoformat(),
         "input_feature_date": input_feature_date.date().isoformat(),
         "target_forecast_date": target_forecast_date.date().isoformat(),
+        "data_through_date": data_through_ts.date().isoformat(),
+        "panel_end_date": panel_end_date.date().isoformat(),
         "latest_panel_close": latest_panel_close,
         "input_close": input_close,
         "pred_class": pred_raw,
@@ -306,6 +294,7 @@ def build_daily_report(
     rs = rs[
         (rs["error"].astype(str).str.len() == 0)
         & (rs["target_mode"].astype(str).str.lower() == "binary")
+        & (rs["target_return_basis"].astype(str).str.lower() == "close")
         & (pd.to_numeric(rs["mean_seq_oos_acc"], errors="coerce") >= float(min_accuracy))
     ].copy()
 
@@ -344,19 +333,17 @@ def build_daily_report(
         sh, n_strat = _binary_sharpe(steps)
         chosen_variant = str(row.get("chosen_variant", "")).strip()
         logger.info(
-            "Forecast %d/%d %s lead=%s basis=%s variant=%s",
+            "Forecast %d/%d %s lead=%s variant=%s",
             i,
             total,
             row["primary"],
             int(row["lead"]),
-            str(row["target_return_basis"]),
             chosen_variant,
         )
         fc = _forecast_one(
             primary=str(row["primary"]),
             all_pairs=all_pairs,
             lead=int(row["lead"]),
-            target_basis=str(row["target_return_basis"]),
             chosen_variant=chosen_variant,
             lookback_bars=int(lookback_bars),
             pca_k=int(pca_k),
@@ -376,7 +363,6 @@ def build_daily_report(
             {
                 "primary": row["primary"],
                 "lead_days": int(row["lead"]),
-                "target_return_basis": row["target_return_basis"],
                 "chosen_variant": chosen_variant,
                 "avg_oos_accuracy": acc,
                 "binary_oos_sharpe": sh,
@@ -388,6 +374,8 @@ def build_daily_report(
                 "latest_labeled_date": fc.get("latest_labeled_date"),
                 "input_feature_date": fc.get("input_feature_date"),
                 "target_forecast_date": fc.get("target_forecast_date"),
+                "data_through_date": fc.get("data_through_date"),
+                "panel_end_date": fc.get("panel_end_date"),
                 "latest_panel_close": fc.get("latest_panel_close"),
                 "input_close": fc.get("input_close"),
                 "pred_class": pred_class,
@@ -418,10 +406,9 @@ def build_daily_report(
                 "family_filter": family_filter,
                 "align_to_next_bar": bool(align_to_next_bar),
                 "note": (
-                    "Binary only. pred_class 1=Buy, 0=Sell. "
-                    "With align_to_next_bar, each model row targets the next session after the feature panel "
-                    "(use after daily data is complete, e.g. post US close). "
-                    "Optional --inject-live-quote appends/refreshes today's synthetic bar from Yahoo when FXNL_INJECT_LIVE_QUOTE=1."
+                    "Binary only, **close-basis labels** (high_low retired). pred_class 1=Buy, 0=Sell. "
+                    "With align_to_next_bar, every row targets the next business day after data_through_date "
+                    "(5 PM America/New_York cutoff; see fxnl.fx_session_calendar)."
                 ),
             },
         ],
